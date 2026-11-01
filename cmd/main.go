@@ -1,224 +1,92 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"io"
-	"io/ioutil"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
-	"sort"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
-
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
-	"github.com/go-chi/cors"
-
-	tf "github.com/tensorflow/tensorflow/tensorflow/go"
 )
 
-var (
-	savedModel   *tf.SavedModel
-	graphModel   *tf.Graph
-	sessionModel *tf.Session
-	labels       []string
-)
-
-// ClassifyResult JSON type result for labelname
-type ClassifyResult struct {
-	Filename string        `json:"filename"`
-	Labels   []LabelResult `json:"labels"`
+func run(ctx context.Context, server *http.Server) error {
+	result := make(chan error, 1)
+	go func() { result <- server.ListenAndServe() }()
+	select {
+	case err := <-result:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		stopCtx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		if err := server.Shutdown(stopCtx); err != nil {
+			_ = server.Close()
+			return err
+		}
+		if err := <-result; !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
 
-// LabelResult JSON type result for label and prob
-type LabelResult struct {
-	Label       string  `json:"label"`
-	Probability float32 `json:"probability"`
+func loadLabels(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	labels := strings.FieldsFunc(string(data), func(r rune) bool { return r == '\n' || r == '\r' })
+	if len(labels) != 2 || labels[0] == labels[1] {
+		return nil, fmt.Errorf("expected two distinct model labels")
+	}
+	return labels, nil
 }
 
 func main() {
-	// Load tensorflow model:
-	workdir, _ := os.Getwd()
-	log.Println("workDir: " + workdir)
-
-	// Load model, use loadModel() function if using just graph file instead of saved model
-	model, err := tf.LoadSavedModel(workdir+"/models/myfirstmodel/2", []string{"serve"}, nil)
-	if err != nil {
-		panic(err)
+	addr := flag.String("addr", "127.0.0.1:9999", "HTTP listen address")
+	modelURL := flag.String("model-url", "http://127.0.0.1:8501/v1/models/hamppa/versions/2", "TensorFlow Serving version URL")
+	labelsPath := flag.String("labels", "models/labels/hamppa/saved_model_labels.txt", "model labels")
+	indexPath := flag.String("index", "index.html", "upload page")
+	flag.Parse()
+	endpoint, err := url.Parse(*modelURL)
+	if err != nil || endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		log.Fatal("model-url must be an HTTP URL on 127.0.0.1 without credentials, query, or fragment")
 	}
-	savedModel = model
-
-	// Load labels
-	labelsFile, err := os.Open(workdir + "/models/labels/hamppa/saved_model_labels.txt")
+	labels, err := loadLabels(*labelsPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer labelsFile.Close()
-	scanner := bufio.NewScanner(labelsFile)
-	// Labels are separated by newlines
-	for scanner.Scan() {
-		labels = append(labels, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		log.Fatal(err)
-	}
-
-	// Start server with chi-router with middleware and cors
-	router := chi.NewRouter()
-
-	cors := cors.New(cors.Options{
-		// AllowedOrigins: []string{"https://foo.com"}, // Use this to allow specific origin hosts
-		AllowedOrigins: []string{"*"},
-		// AllowOriginFunc:  func(r *http.Request, origin string) bool { return true },
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: true,
-		MaxAge:           300, // Maximum value not ignored by any of major browsers
-	})
-
-	router.Use(cors.Handler)
-
-	router.Use(middleware.RequestID)
-	router.Use(middleware.RealIP)
-	router.Use(middleware.Logger)
-	router.Use(middleware.Recoverer)
-
-	router.Use(middleware.Timeout(60 * time.Second))
-
-	router.Post("/api/v1/inference", inferenceHandler)
-
-	// Serve the index.html file at the root path
-	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, filepath.Join(workdir, "index.html"))
-	})
-
-
-	log.Fatal(http.ListenAndServe(":8888", router))
-
-}
-
-func inferenceHandler(w http.ResponseWriter, r *http.Request) {
-	// Read image
-	imageFile, header, err := r.FormFile("image")
-	// Will contain filename and extension
-	imageName := strings.Split(header.Filename, ".")
-	if err != nil {
-		responseError(w, "Could not read image", http.StatusBadRequest)
-		return
-	}
-	defer imageFile.Close()
-	var imageBuffer bytes.Buffer
-	// Copy image data to a buffer
-	io.Copy(&imageBuffer, imageFile)
-
-	log.Println("input image name: " + imageName[:1][0])
-	// ...
-	// Make tensor
-	tensor, err := makeTensorFromImage2(&imageBuffer, imageName[:1][0])
-	if err != nil {
-		responseError(w, "Invalid image", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("image to tensor shape %d: \n", tensor.Shape())
-
-	feedsOutput := tf.Output{
-		Op:    savedModel.Graph.Operation("Placeholder"),
-		Index: 0,
-	}
-	feeds := map[tf.Output]*tf.Tensor{feedsOutput: tensor}
-
-	fetches := []tf.Output{
-		{
-			Op:    savedModel.Graph.Operation("final_result"),
-			Index: 0,
-		},
-	}
-
-	output, err := savedModel.Session.Run(feeds, fetches, nil)
+	index, err := os.ReadFile(*indexPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	log.Printf("output: [ %g, %g ]\n", (output[0].Value().([][]float32)[0][0]), (output[0].Value().([][]float32)[0][1]))
-
-	// Return best labels
-	responseJSON(w, ClassifyResult{
-		Filename: header.Filename,
-		Labels:   findBestLabels(output[0].Value().([][]float32)[0]),
-	})
-
-}
-
-func readImage(url string) []byte {
-	file, err := os.Open(url)
-	if err != nil {
-		panic(err)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.MaxConnsPerHost = 2
+	backend := &modelClient{
+		url: strings.TrimRight(endpoint.String(), "/"),
+		client: &http.Client{Transport: transport, Timeout: 30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
-
-	defer file.Close()
-
-	b, err := ioutil.ReadAll(file)
-	if err != nil {
-		panic(err)
+	app := newApplication(backend, labels, index)
+	server := &http.Server{
+		Addr: *addr, Handler: app, ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout: 15 * time.Second, WriteTimeout: 45 * time.Second,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10,
 	}
-
-	return b
-}
-
-func responseError(w http.ResponseWriter, message string, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func responseJSON(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-// ByProbability Sorts result and labels by result
-type ByProbability []LabelResult
-
-func (a ByProbability) Len() int           { return len(a) }
-func (a ByProbability) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByProbability) Less(i, j int) bool { return a[i].Probability > a[j].Probability }
-
-func findBestLabels(probabilities []float32) []LabelResult {
-	// Make a list of label/probability pairs
-	var resultLabels []LabelResult
-	for i, p := range probabilities {
-		if i >= len(labels) {
-			break
-		}
-		resultLabels = append(resultLabels, LabelResult{Label: labels[i], Probability: p})
-	}
-	// Sort by probability
-	sort.Sort(ByProbability(resultLabels))
-	// Return top 2 labels
-	return resultLabels[:2]
-}
-
-// Used with imported tensorflow graph instead of saved model
-func loadModels() {
-	workdir, _ := os.Getwd()
-	modelfile, err := ioutil.ReadFile(workdir + "/models/graph/test/saved_model.pb")
-	if err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	log.Printf("Serving hamburger demo on %s", *addr)
+	if err := run(ctx, server); err != nil {
 		log.Fatal(err)
 	}
-
-	graphModel = tf.NewGraph()
-	if err := graphModel.Import(modelfile, ""); err != nil {
-		log.Fatal(err)
-	}
-
-	sessionModel, err = tf.NewSession(graphModel, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
+	log.Print("HTTP server stopped")
 }

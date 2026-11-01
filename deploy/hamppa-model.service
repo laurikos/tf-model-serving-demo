@@ -1,0 +1,31 @@
+[Unit]
+Description=Hamburger TensorFlow Serving model
+Requires=docker.service
+After=docker.service network.target
+StartLimitIntervalSec=180
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker run --rm --name hamppa-model --pull=never \
+    --user=65534:65534 --read-only --cap-drop=ALL \
+    --security-opt=no-new-privileges:true --pids-limit=384 \
+    --memory=1200m --memory-swap=1200m --cpus=1 \
+    --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=16m \
+    --log-opt=max-size=10m --log-opt=max-file=2 \
+    --publish=127.0.0.1:8501:8501 \
+    --mount=type=bind,src=/opt/hamppa/models/myfirstmodel,dst=/models/hamppa,readonly \
+    --entrypoint=/usr/bin/tensorflow_model_server \
+    tensorflow/serving@sha256:b09456481317351201fbe0b3c5954273e1b697b4a4a7834dc56f01731137a529 \
+    --model_name=hamppa --model_base_path=/models/hamppa \
+    --port=8500 --rest_api_port=8501 --rest_api_num_threads=2 \
+    --rest_api_timeout_in_ms=20000 \
+    --tensorflow_intra_op_parallelism=1 --tensorflow_inter_op_parallelism=1
+ExecStop=/usr/bin/docker stop --time=30 hamppa-model
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

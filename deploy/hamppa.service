@@ -1,0 +1,29 @@
+[Unit]
+Description=Hamburger demo HTTP application
+Wants=hamppa-model.service
+After=network.target hamppa-model.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/hamppa
+ExecStart=/opt/hamppa/hamppa --addr=127.0.0.1:9999
+Environment=GOMAXPROCS=1 GOMEMLIMIT=192MiB
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=40
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
